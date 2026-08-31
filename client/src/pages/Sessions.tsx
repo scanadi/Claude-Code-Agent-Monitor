@@ -86,12 +86,8 @@ import { EmptyState } from "../components/EmptyState";
 import { TableRowSkeleton } from "../components/Skeleton";
 import { MultiSelect } from "../components/MultiSelect";
 import { Select } from "../components/Select";
-import {
-  useRefreshShortcut,
-  useSearchShortcut,
-  useTabShortcuts,
-  useUrlTab,
-} from "../hooks/usePageShortcuts";
+import { useUrlTab } from "../hooks/usePageShortcuts";
+import { usePaletteAction } from "../components/PaletteActionProvider";
 import { formatDateTime, formatDuration, truncate, fmtCost } from "../lib/format";
 import {
   effectiveSessionStatus,
@@ -134,7 +130,14 @@ export function Sessions() {
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(0);
 
-  const [cwds, setCwds] = useState<string[]>([]);
+  // Seeded from `?cwd=` so the palette's project jump lands on a filtered list.
+  // Only the initial value is read from the URL: the multi-select is the source
+  // of truth afterwards, and rewriting the query on every toggle would make Back
+  // walk through filter states instead of pages.
+  const [cwds, setCwds] = useState<string[]>(() => {
+    const initial = new URLSearchParams(window.location.search).get("cwd");
+    return initial ? [initial] : [];
+  });
   const [sortBy, setSortBy] = useState<SessionSort>("time");
   const [sortDesc, setSortDesc] = useState(true);
   const [directories, setDirectories] = useState<string[]>([]);
@@ -247,9 +250,18 @@ export function Sessions() {
     // the matching `sources` param.
   }, [filter, search, cwds, sortBy, sortDesc, page, scope]);
 
-  useRefreshShortcut(load);
-  useSearchShortcut(searchRef);
-  useTabShortcuts(SESSION_FILTERS, filter, setFilter);
+  usePaletteAction("page.refresh", () => {
+    void load();
+  });
+  usePaletteAction("sessions.sortTime", () => setSortBy("time"));
+  usePaletteAction("sessions.sortDuration", () => setSortBy("duration"));
+  usePaletteAction("sessions.sortCost", () => setSortBy("price"));
+  usePaletteAction("sessions.toggleSortDirection", () => setSortDesc((prev) => !prev));
+  usePaletteAction("sessions.clearFilters", () => {
+    setFilter("");
+    setSearchInput("");
+    setCwds([]);
+  });
 
   useEffect(() => {
     load();

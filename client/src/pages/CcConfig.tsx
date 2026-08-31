@@ -105,12 +105,8 @@ import {
 } from "lucide-react";
 import { api } from "../lib/api";
 import { CodexConfigExplorer } from "../components/CodexConfigExplorer";
-import {
-  useRefreshShortcut,
-  useSearchShortcut,
-  useTabShortcuts,
-  useUrlTab,
-} from "../hooks/usePageShortcuts";
+import { useUrlTab } from "../hooks/usePageShortcuts";
+import { usePaletteAction } from "../components/PaletteActionProvider";
 import type {
   CcArtifactType,
   CcBackup,
@@ -381,9 +377,9 @@ export function CcConfig() {
 
   const wsConnected = useSyncExternalStore(eventBus.onConnection, () => eventBus.connected);
 
-  useRefreshShortcut(fetchAll);
-  useSearchShortcut(searchRef);
-  useTabShortcuts(TAB_KEYS, tab, setTab);
+  usePaletteAction("page.refresh", () => {
+    void fetchAll();
+  });
 
   const openViewer = useCallback(async (path: string) => {
     setViewer({ path, data: null, error: null });

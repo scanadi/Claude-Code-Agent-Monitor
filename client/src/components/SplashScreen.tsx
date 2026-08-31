@@ -62,7 +62,15 @@ import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
 import { setProviderScope, type ProviderScope } from "../lib/dataScope";
 
-const SESSION_KEY = "provider-onboarding-shown-v1";
+/**
+ * Marks that onboarding has run in this browser.
+ *
+ * Deliberately `localStorage`, not `sessionStorage`: a new tab — which is what
+ * ⌘/Ctrl-clicking a link opens — gets a fresh `sessionStorage`, so the previous
+ * key showed the splash again to someone who had already onboarded. The version
+ * suffix is bumped alongside the storage change so the two cannot be confused.
+ */
+const ONBOARDING_KEY = "provider-onboarding-shown-v2";
 
 type HookProvider = Exclude<ProviderScope, "both">;
 
@@ -104,11 +112,13 @@ function greetingKey(hour: number): "morning" | "afternoon" | "evening" | "night
 
 export function SplashScreen() {
   const { t } = useTranslation("splash");
-  // Show at most once per tab session. Read synchronously so we never flash an
-  // empty overlay on a repeat mount (StrictMode double-invoke, refresh, etc.).
+  // Show at most once per browser. Read synchronously so we never flash an empty
+  // overlay on a repeat mount (StrictMode double-invoke, refresh, new tab).
+  // A storage failure (private mode, blocked site data) falls back to showing
+  // it: onboarding twice is a nuisance, never onboarding is a broken install.
   const [mounted, setMounted] = useState(() => {
     try {
-      return !sessionStorage.getItem(SESSION_KEY);
+      return !localStorage.getItem(ONBOARDING_KEY);
     } catch {
       return true;
     }
@@ -145,7 +155,7 @@ export function SplashScreen() {
   const finishOnboarding = () => {
     setProviderScope(provider);
     try {
-      sessionStorage.setItem(SESSION_KEY, "1");
+      localStorage.setItem(ONBOARDING_KEY, "1");
     } catch {
       /* storage may be unavailable; the in-memory scope still updates */
     }
