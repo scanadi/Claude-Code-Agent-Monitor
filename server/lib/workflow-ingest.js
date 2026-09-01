@@ -29,6 +29,15 @@
  * Per-agent token/tool/duration metrics come from the journal's progress[]
  * JSON — this module never writes token_usage, so it cannot double-count.
  *
+ * Ingestion is gated by the owning session's lifecycle: once the session has
+ * ended (sessions.ended_at set), no path here stamps agents "working" — a run
+ * with no terminal journal in this session's folder can never finish (its
+ * fleet died with the session, or continued under a resumed session id whose
+ * journal lands in that other folder), so result-less agents close as
+ * completed/"interrupted" and a session-end cascade (closeEndedSessionAgents /
+ * closeEndedSessionWorkflows) backstops every path. Without this, re-ingestion
+ * resurrected zombie "working" agents on sessions that ended weeks earlier.
+ *
  * All functions are fail-safe: a malformed/partial journal throws only locally
  * and is skipped; ingestion never blocks or breaks hook handling.
  * @author Son Nguyen <hoangson091104@gmail.com>
@@ -316,7 +325,11 @@ async function ingestWorkflowJournal(dbModule, sessionId, journal, opts = {}) {
   for (const entry of agentEntries) {
     const agentId = entry.agentId;
     const jsonlId = `${sessionId}-jsonl-${agentId}`;
-    const status = mapState(entry.state);
+    // A journal can carry non-terminal states (run killed mid-flight). Once the
+    // owning session has ended those agents can never progress, so stamping
+    // "working" would leave permanent zombie cards — close them instead.
+    const mapped = mapState(entry.state);
+    const status = opts.sessionEndedAt && mapped === "working" ? "completed" : mapped;
     const phase = entry.phaseTitle || null;
     // subagent_type: prefer the label's prefix (e.g. "scout:starship" → "scout")
     // for nicer grouping; otherwise the generic workflow-subagent type.
@@ -411,8 +424,24 @@ function bucketTotal(tokensByModel) {
  * terminal journal), so phaseTitle is null and label falls back to the agent's
  * prompt. The fast poll re-runs this as the files grow, so tokens/tools/agents
  * update live. Returns { row, tokens } or null.
+ *
+ * `sessionEndedAt` (the owning session's ended_at, when set) flips the run
+ * into terminal mode: a run with no terminal journal in THIS session's folder
+ * can never finish once the session is over — its fleet died with the session,
+ * or the run continued under a resumed session id whose journal lands in that
+ * other session's folder. Result-less agents are then stamped "interrupted"/
+ * completed instead of "running"/working, and the run row upserts as
+ * completed, so re-ingestion (boot backfill, hook-triggered scans) cannot
+ * resurrect zombie "working" agents on an ended session.
  */
-async function ingestLiveWorkflow(dbModule, sessionId, sessionDir, runId, scriptPath) {
+async function ingestLiveWorkflow(
+  dbModule,
+  sessionId,
+  sessionDir,
+  runId,
+  scriptPath,
+  sessionEndedAt = null
+) {
   const { stmts } = dbModule;
   const mainAgentId = `${sessionId}-main`;
   const ih = importHistory();
@@ -467,7 +496,7 @@ async function ingestLiveWorkflow(dbModule, sessionId, sessionDir, runId, script
       parsed = null;
     }
     const done = doneResults.has(agentId);
-    const state = done ? "done" : "running";
+    const state = done ? "done" : sessionEndedAt ? "interrupted" : "running";
     const aTok = parsed ? bucketTotal(parsed.tokensByModel) : 0;
     const tools = parsed && parsed.toolNames ? parsed.toolNames : [];
     const startedAt = parsed && parsed.startedAt ? parsed.startedAt : null;
@@ -534,7 +563,7 @@ async function ingestLiveWorkflow(dbModule, sessionId, sessionDir, runId, script
       label: null,
       phaseTitle: null,
       model: null,
-      state: doneResults.has(agentId) ? "done" : "running",
+      state: doneResults.has(agentId) ? "done" : sessionEndedAt ? "interrupted" : "running",
       tokens: 0,
       toolCalls: 0,
       durationMs: null,
@@ -551,16 +580,24 @@ async function ingestLiveWorkflow(dbModule, sessionId, sessionDir, runId, script
     }
   }
   const durationMs = earliest && latest ? latest - earliest : null;
+  // Terminal mode: the best-known end is the fleet's latest transcript
+  // activity (it can outlive the session's own SessionEnd by a few minutes),
+  // falling back to the session's ended_at.
+  const endedAtIso = sessionEndedAt
+    ? latest
+      ? new Date(latest).toISOString()
+      : sessionEndedAt
+    : null;
 
   stmts.upsertWorkflow.run(
     runId,
     sessionId,
     null,
     scriptPath ? nameFromScript(scriptPath) : runId,
-    "running",
+    sessionEndedAt ? "completed" : "running",
     model,
     startedAtIso,
-    null,
+    endedAtIso,
     durationMs,
     progress.length,
     totalTokens,
@@ -647,6 +684,20 @@ async function ingestWorkflowsForSession(dbModule, session) {
   const transcriptPath = resolveTranscriptPath(session);
   if (!transcriptPath) return [];
 
+  // The owning session's lifecycle gates how agent states are stamped. Once a
+  // session has ended (ended_at is the durable marker; reactivation clears it),
+  // a run without a terminal journal in this session's folder can never finish,
+  // so no ingest below may mark its agents "working" — that is how re-ingestion
+  // (SessionEnd's own scan, boot backfill, import rescans) used to resurrect
+  // zombie kanban cards on sessions that ended weeks earlier.
+  let sessionEndedAt = null;
+  try {
+    const row = dbModule.stmts.getSession.get(sessionId);
+    if (row && row.ended_at) sessionEndedAt = row.ended_at;
+  } catch {
+    /* fail-safe: treat the session as live */
+  }
+
   const paths = findSessionWorkflows(transcriptPath);
   if (paths.journals.length === 0 && paths.scripts.length === 0 && paths.liveRuns.length === 0) {
     return [];
@@ -671,6 +722,7 @@ async function ingestWorkflowsForSession(dbModule, session) {
       const res = await ingestWorkflowJournal(dbModule, sessionId, journal, {
         sessionDir: paths.sessionDir,
         scriptPath: scriptByRun.get(journal.runId) || null,
+        sessionEndedAt,
       });
       if (res && res.row) changed.push(res.row);
       if (res && res.tokens) mergeWorkflowTokens(workflowTokens, res.tokens);
@@ -690,7 +742,8 @@ async function ingestWorkflowsForSession(dbModule, session) {
         sessionId,
         paths.sessionDir,
         lr.runId,
-        scriptByRun.get(lr.runId) || null
+        scriptByRun.get(lr.runId) || null,
+        sessionEndedAt
       );
       if (res && res.row) {
         changed.push(res.row);
@@ -707,6 +760,24 @@ async function ingestWorkflowsForSession(dbModule, session) {
     changed.push(...detectRunningWorkflows(dbModule, sessionId, paths, handled));
   } catch {
     /* non-fatal */
+  }
+
+  // Session-end safety cascade: after every ingest path has run, an ended
+  // session must hold no working/waiting agents and no "running" run rows
+  // (including any a launch-script scan just created above). Idempotent, and a
+  // backstop for anything the per-path guards missed. Rows already broadcast
+  // into `changed` are re-read so subscribers never see a stale "running" row.
+  if (sessionEndedAt) {
+    try {
+      dbModule.stmts.closeEndedSessionAgents.run(sessionEndedAt, sessionId);
+      dbModule.stmts.closeEndedSessionWorkflows.run(sessionEndedAt, sessionId);
+      for (let i = 0; i < changed.length; i++) {
+        const fresh = changed[i] && dbModule.stmts.getWorkflow.get(changed[i].run_id);
+        if (fresh) changed[i] = fresh;
+      }
+    } catch {
+      /* non-fatal — cleanup must never break ingestion */
+    }
   }
 
   // Fold the workflow fleet's token usage into the session cost under a

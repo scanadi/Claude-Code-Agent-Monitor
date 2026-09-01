@@ -1228,14 +1228,48 @@ db.prepare(
 `
 ).run();
 
-// Startup cleanup: complete orphaned agents on finished sessions
+// Startup cleanup: complete orphaned agents on finished sessions.
+// Covers two zombie shapes: non-terminal status (working/waiting) and a
+// missing ended_at on an already-terminal row (journal-fallback inserts never
+// stamp one). ended_at backfills from the owning session's own ended_at so a
+// weeks-old leak doesn't get stamped with today's boot time; an error status
+// is preserved — only the timestamp is repaired.
 db.prepare(
   `
   UPDATE agents SET
+    status = CASE WHEN status IN ('working', 'waiting') THEN 'completed' ELSE status END,
+    ended_at = COALESCE(
+      ended_at,
+      (SELECT s.ended_at FROM sessions s WHERE s.id = agents.session_id),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+  WHERE (status IN ('working', 'waiting') OR ended_at IS NULL)
+    AND session_id IN (
+      SELECT id FROM sessions
+      WHERE status IN ('completed', 'error', 'abandoned') OR ended_at IS NOT NULL
+    )
+`
+).run();
+
+// Startup cleanup: complete workflow runs stranded "running" on finished
+// sessions. A run whose terminal journal never landed in ITS session's folder
+// (fleet killed with the session, or the run continued under a resumed session
+// id whose journal lands in that other session's folder) re-ingests forever as
+// "live"; once the owning session has ended it can never complete on its own.
+db.prepare(
+  `
+  UPDATE workflows SET
     status = 'completed',
-    ended_at = COALESCE(ended_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-  WHERE status IN ('working', 'waiting')
-    AND session_id IN (SELECT id FROM sessions WHERE status IN ('completed', 'error', 'abandoned'))
+    ended_at = COALESCE(
+      ended_at,
+      (SELECT s.ended_at FROM sessions s WHERE s.id = workflows.session_id),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+  WHERE status = 'running'
+    AND session_id IN (
+      SELECT id FROM sessions
+      WHERE status IN ('completed', 'error', 'abandoned') OR ended_at IS NOT NULL
+    )
 `
 ).run();
 
@@ -2054,6 +2088,30 @@ const stmts = {
   workflowStatusCounts: db.prepare("SELECT status, COUNT(*) AS n FROM workflows GROUP BY status"),
   setAgentWorkflow: db.prepare(
     "UPDATE agents SET workflow_run_id = ?, workflow_phase = ?, status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?"
+  ),
+  // Session-end safety cascade. Once a session has ended, none of its agents
+  // can still be running: close working/waiting rows and backfill a missing
+  // ended_at (param: the session's own ended_at) without clobbering an agent's
+  // real transcript-derived ended_at or an error status. Run at every session
+  // termination and after workflow ingestion of an ended session, so no ingest
+  // path can resurrect "working" rows (zombie kanban cards).
+  closeEndedSessionAgents: db.prepare(
+    `UPDATE agents SET
+       status = CASE WHEN status IN ('working', 'waiting') THEN 'completed' ELSE status END,
+       ended_at = COALESCE(ended_at, ?),
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+     WHERE session_id = ?
+       AND (status IN ('working', 'waiting') OR ended_at IS NULL)`
+  ),
+  // Companion cascade for the workflows table: a run still "running" when its
+  // owning session has ended can never complete on its own (its terminal
+  // journal will never land in this session's folder).
+  closeEndedSessionWorkflows: db.prepare(
+    `UPDATE workflows SET
+       status = 'completed',
+       ended_at = COALESCE(ended_at, ?),
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+     WHERE session_id = ? AND status = 'running'`
   ),
   listAgentsByWorkflow: db.prepare(
     "SELECT * FROM agents WHERE workflow_run_id = ? ORDER BY started_at ASC, id ASC"
