@@ -682,6 +682,10 @@ const processEvent = db.transaction((hookType, data) => {
             broadcast("agent_updated", stmts.getAgent.get(agent.id));
           }
         }
+        // Safety cascade: same as SessionEnd — no agent or run of an abandoned
+        // session may stay working/running, whatever the loop above matched.
+        stmts.closeEndedSessionAgents.run(now, stale.id);
+        stmts.closeEndedSessionWorkflows.run(now, stale.id);
         stmts.updateSession.run(null, "abandoned", now, null, stale.id);
         broadcast("session_updated", stmts.getSession.get(stale.id));
       }
@@ -714,6 +718,11 @@ const processEvent = db.transaction((hookType, data) => {
           broadcast("agent_updated", stmts.getAgent.get(agent.id));
         }
       }
+      // Safety cascade: backfill ended_at on any already-terminal agent row the
+      // loop above skipped, and close runs stranded "running" (their journal
+      // can no longer land in this session's folder).
+      stmts.closeEndedSessionAgents.run(now, sessionId);
+      stmts.closeEndedSessionWorkflows.run(now, sessionId);
       stmts.updateSession.run(null, finalSessionStatus, now, null, sessionId);
       broadcast("session_updated", stmts.getSession.get(sessionId));
 
@@ -1680,6 +1689,10 @@ function livenessReap({ ignoreIdleGate = false, provider = "claude" } = {}) {
         stmts.updateAgent.run(null, "completed", null, null, ts, null, agent.id);
       }
     }
+    // Safety cascade: same as SessionEnd — close leftover ended_at gaps and
+    // runs stranded "running" now that the session is definitively dead.
+    stmts.closeEndedSessionAgents.run(ts, sess.id);
+    stmts.closeEndedSessionWorkflows.run(ts, sess.id);
     stmts.updateSession.run(null, "completed", ts, null, sess.id);
 
     const label = sess.name || `Session ${sess.id.slice(0, 8)}`;

@@ -5,8 +5,19 @@
  * @author Son Nguyen <hoangson091104@gmail.com>
  */
 
-const { describe, it } = require("node:test");
+const { describe, it, after } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+// Isolate the DB BEFORE any server require: routes/pricing pulls in ../db,
+// whose load-time migrations/sweeps would otherwise run against the user's
+// real dashboard.db every time this suite runs.
+process.env.DASHBOARD_DB_PATH = path.join(
+  os.tmpdir(),
+  `dashboard-pricing-test-${Date.now()}-${process.pid}.db`
+);
 
 const { calculateCost, calculateGptCost, calculateProviderCost } = require("../routes/pricing");
 const {
@@ -15,6 +26,19 @@ const {
   normalizeTier,
   extractUsageFields,
 } = require("../lib/token-usage");
+
+after(() => {
+  try {
+    require("../db").db.close();
+  } catch {
+    /* ignore */
+  }
+  try {
+    fs.rmSync(process.env.DASHBOARD_DB_PATH, { force: true });
+  } catch {
+    /* ignore */
+  }
+});
 
 const M = 1_000_000;
 

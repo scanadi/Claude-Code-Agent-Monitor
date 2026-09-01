@@ -1556,6 +1556,20 @@ The ingester handles both phases:
   `status: running` and **replaced by the terminal journal on completion**
   (idempotent upsert by `run_id`; launch time preserved). A launch script with
   no run dir yet falls back to a minimal `running` row.
+- **Interrupted runs** (owning session ended, `sessions.ended_at` set): a run
+  still lacking a terminal journal in this session's folder can never finish —
+  its fleet died with the session, or the run continued under a resumed session
+  id whose journal lands in **that** session's folder. Ingestion therefore
+  flips terminal: result-less agents are stamped `completed` (progress state
+  `interrupted`) instead of `working`, the run row upserts as `completed`, and
+  a session-end cascade (`closeEndedSessionAgents` / `closeEndedSessionWorkflows`
+  in `server/db.js`, also run by the `SessionEnd` / abandon / liveness-reap
+  handlers) closes any leftover working/waiting agents and backfills missing
+  `ended_at` from the session's own end. Without this gate, re-ingestion (the
+  `SessionEnd` hook's own scan, the boot backfill, CLI rescans) used to
+  resurrect zombie `working` agents on sessions that ended weeks earlier.
+  Matching boot-time sweeps in `server/db.js` heal rows leaked by older builds
+  (agents *and* stranded `running` workflow rows) on every start.
 
 ### Ingestion module and triggers
 

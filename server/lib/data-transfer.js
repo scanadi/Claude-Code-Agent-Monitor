@@ -95,7 +95,10 @@ function makeInserter(db, table, { omit = [] } = {}) {
   const quoted = cols.map((c) => `"${c}"`).join(", ");
   const placeholders = cols.map(() => "?").join(", ");
   const stmt = db.prepare(`INSERT OR IGNORE INTO ${table} (${quoted}) VALUES (${placeholders})`);
-  return (row) => stmt.run(cols.map((c) => bindable(row[c])));
+  // Spread, don't pass the array: better-sqlite3 binds an array positionally,
+  // but the node:sqlite fallback reads it as named params ("0", "1", …) and
+  // throws `Unknown named parameter '0'`, breaking restore without the addon.
+  return (row) => stmt.run(...cols.map((c) => bindable(row[c])));
 }
 
 /** Group an array of rows by a key field into a Map. */

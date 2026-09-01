@@ -4,11 +4,15 @@
  * `${sessionId}-jsonl-<agentId>` id scheme, idempotency, running→completed
  * detection with launch-time preservation, and folding inner-agent token usage
  * into the session cost under a namespaced `workflow` service_tier.
+ * Also covers the ended-session zombie-agent guard (no ingest path may stamp
+ * "working" agents or "running" runs on a session whose ended_at is set) and
+ * the boot-time db.js sweeps that heal rows leaked by older builds.
  * @author Son Nguyen <hoangson091104@gmail.com>
  */
 
 const { describe, it, before, after } = require("node:test");
 const assert = require("node:assert/strict");
+const { execFileSync } = require("node:child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -441,6 +445,10 @@ describe("live running workflow (no terminal journal)", () => {
 
     // inner agents linked + live workflow tokens folded under the workflow tier
     assert.equal(stmts.listAgentsByWorkflow.all(runId).length, 2);
+    // Control for the ended-session guard below: while the session is ACTIVE a
+    // result-less agent must keep showing as working (real-time behavior).
+    assert.equal(stmts.getAgent.get(`${SESSION_ID}-jsonl-a1`).status, "completed");
+    assert.equal(stmts.getAgent.get(`${SESSION_ID}-jsonl-a2`).status, "working");
     const liveTier = dbModule.db
       .prepare("SELECT COUNT(*) AS n FROM token_usage WHERE session_id = ? AND service_tier = ?")
       .get(SESSION_ID, "workflow");
@@ -459,5 +467,177 @@ describe("ingestAllWorkflows backfill", () => {
     assert.ok(res.workflows >= 1, "at least one workflow ingested");
     // The completed fixture run is present after backfill.
     assert.ok(stmts.getWorkflow.get("wf_test123"), "fixture run present");
+  });
+});
+
+// Regression net for the zombie-agent leak: a run interrupted by its session
+// ending (fleet killed, or resumed under a new session id whose journal lands
+// in that other session's folder) has result-less agents that no journal will
+// ever complete. Every re-ingest used to stamp them status "working" forever.
+describe("ended-session ingestion (zombie-agent guard)", () => {
+  const ENDED_ID = "sess-wf-ended";
+  const ENDED_AT = "2026-03-01T10:00:00.000Z";
+  let endedTranscript;
+
+  before(() => {
+    endedTranscript = path.join(ROOT, `${ENDED_ID}.jsonl`);
+    fs.writeFileSync(endedTranscript, "");
+    stmts.insertSession.run(ENDED_ID, "Ended WF session", "completed", "/tmp/proj", null, null);
+    dbModule.db.prepare("UPDATE sessions SET ended_at = ? WHERE id = ?").run(ENDED_AT, ENDED_ID);
+    stmts.insertAgent.run(
+      `${ENDED_ID}-main`,
+      ENDED_ID,
+      "Main",
+      "main",
+      null,
+      "completed",
+      null,
+      null,
+      null
+    );
+
+    // Interrupted live run: e1 finished (has a result event), e2 died in
+    // flight (started, transcript on disk, no result — the leak's exact shape).
+    const runDir = path.join(ROOT, ENDED_ID, "subagents", "workflows", "wf_dead1");
+    fs.mkdirSync(runDir, { recursive: true });
+    fs.writeFileSync(path.join(runDir, "agent-e1.jsonl"), agentJsonl("claude-opus-4-8", 100, 50));
+    fs.writeFileSync(path.join(runDir, "agent-e2.jsonl"), agentJsonl("claude-opus-4-8", 200, 60));
+    fs.writeFileSync(
+      path.join(runDir, "journal.jsonl"),
+      [
+        JSON.stringify({ type: "started", agentId: "e1" }),
+        JSON.stringify({ type: "started", agentId: "e2" }),
+        JSON.stringify({ type: "result", agentId: "e1", result: { ok: true } }),
+      ].join("\n")
+    );
+  });
+
+  it("closes result-less live agents as completed instead of stamping working", async () => {
+    await ingestWorkflowsForSession(dbModule, {
+      id: ENDED_ID,
+      transcript_path: endedTranscript,
+    });
+
+    const e1 = stmts.getAgent.get(`${ENDED_ID}-jsonl-e1`);
+    const e2 = stmts.getAgent.get(`${ENDED_ID}-jsonl-e2`);
+    assert.equal(e1.status, "completed");
+    assert.equal(
+      e2.status,
+      "completed",
+      "no result event + ended session → completed, not working"
+    );
+    assert.ok(e2.ended_at, "closed agent carries an ended_at");
+
+    const wf = stmts.getWorkflow.get("wf_dead1");
+    assert.equal(wf.status, "completed", "interrupted run upserts as completed, not running");
+    assert.ok(wf.ended_at, "terminal run row carries an ended_at");
+    const prog = JSON.parse(wf.progress);
+    assert.equal(prog.find((p) => p.agentId === "e1").state, "done");
+    assert.equal(prog.find((p) => p.agentId === "e2").state, "interrupted");
+  });
+
+  it("stays closed on re-ingest — the historical zombie-maker was re-ingestion", async () => {
+    await ingestWorkflowsForSession(dbModule, {
+      id: ENDED_ID,
+      transcript_path: endedTranscript,
+    });
+    assert.equal(stmts.getAgent.get(`${ENDED_ID}-jsonl-e2`).status, "completed");
+    assert.equal(stmts.getWorkflow.get("wf_dead1").status, "completed");
+  });
+
+  it("coerces non-terminal journal states to completed on an ended session", async () => {
+    // Terminal journal snapshotted mid-run (killed fleet): e9 still "running",
+    // with no transcript file → exercises the fallback insertAgent path too.
+    writeJson(path.join(ROOT, ENDED_ID, "workflows", "wf_dead2.json"), {
+      runId: "wf_dead2",
+      workflowName: "killed-run",
+      status: "completed",
+      startTime: 1700000100000,
+      durationMs: 1000,
+      workflowProgress: [
+        { type: "workflow_agent", agentId: "e9", state: "running", label: "scout:x" },
+      ],
+    });
+    await ingestWorkflowsForSession(dbModule, {
+      id: ENDED_ID,
+      transcript_path: endedTranscript,
+    });
+    const e9 = stmts.getAgent.get(`${ENDED_ID}-jsonl-e9`);
+    assert.equal(e9.status, "completed", "journal 'running' on an ended session → completed");
+    assert.equal(e9.ended_at, ENDED_AT, "cascade backfills ended_at from the session's end");
+  });
+
+  it("cascade closes pre-existing zombie rows during any ingest of the session", async () => {
+    stmts.insertAgent.run(
+      `${ENDED_ID}-jsonl-legacy`,
+      ENDED_ID,
+      "Zombie",
+      "subagent",
+      "workflow-subagent",
+      "working",
+      null,
+      `${ENDED_ID}-main`,
+      null
+    );
+    await ingestWorkflowsForSession(dbModule, {
+      id: ENDED_ID,
+      transcript_path: endedTranscript,
+    });
+    const z = stmts.getAgent.get(`${ENDED_ID}-jsonl-legacy`);
+    assert.equal(z.status, "completed");
+    assert.equal(z.ended_at, ENDED_AT);
+  });
+});
+
+// The boot-time sweeps in db.js are the one-off migration for rows leaked by
+// older builds; they run at module load, so they need fresh processes to test.
+describe("startup sweep migration (db.js load-time)", () => {
+  it("heals zombie agents and stranded running workflows on boot", () => {
+    const dbPath = path.join(os.tmpdir(), `wf-sweep-${Date.now()}-${process.pid}.db`);
+    const env = { ...process.env, DASHBOARD_DB_PATH: dbPath };
+    const dbJs = JSON.stringify(path.join(__dirname, "..", "db.js"));
+
+    // Boot 1: create schema, then seed the zombie matrix AFTER load-time
+    // sweeps have already run (so only boot 2's sweeps can heal it):
+    //  z1 working WITH ended_at (the exact shape of the observed leak),
+    //  z2 error without ended_at, main working without ended_at,
+    //  wf_zomb1 stranded "running".
+    const seed = `
+      const m = require(${dbJs});
+      m.stmts.insertSession.run("s-dead", "Dead", "completed", "/tmp/p", null, null);
+      m.db.prepare("UPDATE sessions SET ended_at = '2026-01-05T00:00:00.000Z' WHERE id = 's-dead'").run();
+      m.stmts.insertAgent.run("s-dead-main", "s-dead", "Main", "main", null, "working", null, null, null);
+      m.stmts.insertAgent.run("s-dead-jsonl-z1", "s-dead", "Z1", "subagent", "workflow-subagent", "working", null, "s-dead-main", null);
+      m.db.prepare("UPDATE agents SET ended_at = '2026-01-05T00:01:00.000Z' WHERE id = 's-dead-jsonl-z1'").run();
+      m.stmts.insertAgent.run("s-dead-jsonl-z2", "s-dead", "Z2", "subagent", "workflow-subagent", "error", null, "s-dead-main", null);
+      m.stmts.upsertWorkflow.run("wf_zomb1", "s-dead", null, "n", "running", null, null, null, null, 0, 0, 0, null, null, null, null, "live");
+      m.db.close();
+    `;
+    execFileSync(process.execPath, ["-e", seed], { env });
+
+    // Boot 2: load-time sweeps run again and must heal every zombie shape.
+    const check = `
+      const m = require(${dbJs});
+      console.log(JSON.stringify({
+        z1: m.stmts.getAgent.get("s-dead-jsonl-z1"),
+        z2: m.stmts.getAgent.get("s-dead-jsonl-z2"),
+        main: m.stmts.getAgent.get("s-dead-main"),
+        wf: m.stmts.getWorkflow.get("wf_zomb1"),
+      }));
+      m.db.close();
+    `;
+    const stdout = execFileSync(process.execPath, ["-e", check], { env }).toString();
+    const out = JSON.parse(stdout.trim().split("\n").pop());
+
+    assert.equal(out.z1.status, "completed");
+    assert.equal(out.z1.ended_at, "2026-01-05T00:01:00.000Z", "existing ended_at preserved");
+    assert.equal(out.z2.status, "error", "error status preserved");
+    assert.equal(out.z2.ended_at, "2026-01-05T00:00:00.000Z", "ended_at backfilled from session");
+    assert.equal(out.main.status, "completed");
+    assert.equal(out.main.ended_at, "2026-01-05T00:00:00.000Z");
+    assert.equal(out.wf.status, "completed", "stranded running workflow completed");
+    assert.equal(out.wf.ended_at, "2026-01-05T00:00:00.000Z");
+
+    fs.rmSync(dbPath, { force: true });
   });
 });
